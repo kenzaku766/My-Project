@@ -1,0 +1,205 @@
+# `libProject.so` — Part 3: The Validator, the Render Path, and the EXACT crash pointer
+
+Tool: **radare2 6.1.7** (built from source, `linux-arm_64`).
+Target: `libProject.so` — ELF64, **AArch64**, PIE, **stripped**, clang 7.0.0 (Android NDK), C++/libc++.
+Scope: User's own project (kenzaku766/My-Project), authorized study.
+Follows `login_study_continued.md` and `login_study_part2_crash_and_antitamper.md`.
+
+> Reminder: PIE, `.text` maps at file-offset 0 → **virtual address == file offset** for every address below.
+
+---
+
+## TL;DR
+1. **The validator is `fcn.00250dc8`** — it is *not* a simple boolean check. It (a) **waits** on a network-ready
+   flag, (b) reads the server response, (c) requires the response to equal **`"OK"`**, then (d) compares **two
+   runtime std::strings** and only then sets `g_isLoggedIn`.
+2. **`fcn.0018d250` is NOT the auth config parser** — it's a resource/string builder (writes `.png` paths and
+   `sscanf` format strings). The earlier note's "inject config here" suggestion targeted the wrong function.
+3. **The exact crash pointer is now pinned *statically*** (no logcat needed): the global object pointer at
+   **`0x5d71b0`**. The menu builders do `x0 = *(0x5d71b0); vtable = *x0; call vtable[+0x20]`. With login
+   skipped, `0x5d71b0` is **NULL** → `ldr x8,[x0]` faults → **SIGSEGV exactly as the menu appears**. This answers
+   Part 2 §5.
+4. Every global the logged-in path needs (`0x5d71b0`, `0x5d73c0`, `0x5d7270`, `0x5d7258`) lives in **`.bss`**
+   → all **zero/NULL at load**, populated **only** by a real login. That coupling is the protection.
+
+---
+
+## 1. The validator — `fcn.00250dc8` (672 bytes, the *real* login logic)
+
+Signature: `fcn.00250dc8(std::string *response /*x0*/)`. It has **no direct caller** in the binary — it is
+invoked **indirectly** (network/HTTP completion callback, via function pointer/thread). Annotated flow:
+
+```
+0x250e14  stlrb w9(=1), [0x5d8628]        ; g_check_inprogress = 1   (atomic "busy" flag)
+
+; ---- (A) WAIT for the network response, up to 0x31 (49) spins ----
+0x250e24  ldarb w8, [0x5deb08]            ; g_net_ready  (set by the HTTP callback)
+0x250e28  tbnz  w8, 0, 0x250e6c           ; already ready? skip wait
+0x250e40  .. print "Loading config..."  (0x4a3fb3)
+0x250e54  bl    sleep(0)
+0x250e58  ldarb w8, [0x5deb08]            ; re-poll
+0x250e5c  cmp   w25, 0x31                 ; counter vs 49
+0x250e60  b.hi  0x250e6c                  ; timed out
+0x250e68  tbz   w8,0, 0x250e40            ; loop while not ready
+
+0x250e6c  ldarb w8, [0x5deb08]
+0x250e70  tbnz  w8,0, 0x250e8c            ; ready -> parse; else:
+0x250e74  .. print "Config not loaded" (0x4a3fc5) -> log+return (FAIL)
+
+; ---- (B) take the response and require it to be exactly "OK" ----
+0x250e8c  ... read response std::string (SSO/heap c_str of x19=arg) ...
+0x250ea4  bl    0x190620                  ; copy/normalise -> stack buffer
+0x250ee0  bl    0x16d00c                  ; assign into g_response_str @ 0x5ddfc8
+0x250f0c  cmp   len, 2
+0x250f18  mov   w9, 0x4b4f ('OK')
+0x250f1c  cmp   resp[0:2], 'OK'
+0x250f20  b.eq  0x250f68                  ; response == "OK" -> proceed
+          (else) print 0x5d8630 path -> clear busy -> return (FAIL)
+
+; ---- (C) final decision: compare two runtime std::strings ----
+0x250f68  ldrb  w8, [0x5d84d0]            ; cfg_gate boolean
+0x250f70  cbz   w8, 0x251000              ;   if 0 -> g_isLoggedIn = 0
+0x250f74  x8 = std::string @ 0x5d7270     ; (the value the SERVER/config returned)
+0x250f80  x11 = std::string @ 0x5d7258    ; (the value we EXPECTED)
+          ... length compare, then byte loop / memcmp @ 0x251024 ...
+0x251040  strb  w9(=1), [0x5deb58]        ; g_isLoggedIn = 1   (MATCH)
+0x251000  strb  wzr,    [0x5deb58]        ; g_isLoggedIn = 0   (MISMATCH)
+0x251048/.. print "Login Success"(0x4a3fd7) / "Auth Failed"(0x4a3fe5)
+0x250f34  stlrb wzr, [0x5d8628]           ; g_check_inprogress = 0
+```
+
+**Strings verified this session** (all in `.rodata`):
+
+| Addr | String | Role |
+|---|---|---|
+| `0x4a3fa7` | `Checking...` | start of check |
+| `0x4a3fb3` | `Loading config...` | wait-loop message |
+| `0x4a3fc5` | `Config not loaded` | network timeout / FAIL |
+| `0x4a3fd7` | `Login Success` | match |
+| `0x4a3fe5` | `Auth Failed` | mismatch |
+| `0x4a3f9a` | `Expired : %s` | expiry (render path) |
+
+**Takeaway:** "login" = *server says `OK`* **AND** *the returned token (`0x5d7270`) equals the expected token
+(`0x5d7258`)* **AND** *`cfg_gate 0x5d84d0` is set*. All three are produced by the live network/config flow.
+
+---
+
+## 2. Correction: `fcn.0018d250` is a resource builder, not the auth parser
+
+`axff @ 0x18d250` shows it calling `malloc/strlen/memcpy` and referencing:
+- `str.country_158.png` (`0x4a2…`) and a table of `.png`/asset names,
+- repeated `sscanf`-style format constants at `0x49c000`,
+and writing into the `0x5e0000` page. That is **UI/asset string construction**, not login config.
+➡️ The Part 2 idea of "hook `fcn.0018d250` to inject a known-good config" was aimed at the **wrong** function.
+The data the login actually consumes is the `.bss` set in §4 below, produced by the validator path (§1) and
+the response handler that fills `0x5deb08`/`0x5ddfc8`/`0x5d7258`/`0x5d7270`.
+
+---
+
+## 3. The success render path — `fcn.002522e8` @ `0x252778` (decoded)
+
+Reached after the gate + key re-check succeed. This is the code that **runs the moment the menu appears**:
+
+```
+0x252778  x9 = std::string @ 0x5d73c0      ; the validkey/expiry TEXT
+0x2527b0  x1 = "%d-%d-%d %d:%d:%d" @0x49cac5; date-time format
+0x2527c4  bl  sscanf                         ; parse Y-M-D h:m:s from 0x5d73c0
+0x2527d0  ldr d1, [0x494df0] = {-1, -1900}   ; tm adjust: tm_mon-=1, tm_year-=1900
+0x2527e0  bl  mktime                          ; -> expiry epoch
+0x2527f0  str x0, [0x5d8830]                  ; g_expiry_ts = epoch
+0x2527e8  ldrb w8, [0x5de7f8]                 ; g_menu_built flag
+0x2527f8  bl  0x229760                        ; build menu part 1   ── deref 0x5d71b0
+0x252800  bl  0x227b9c                        ; build menu part 2   ── deref 0x5d71b0
+0x252808  strb w8(=1), [0x5de7f8]            ; g_menu_built = 1
+0x25280c  bl  0x22eb08                        ; render main menu    ── deref 0x5d71b0
+```
+
+- `sscanf` constant `0x494df0 = 0xffffffff, 0xfffff894` = `-1` and `-1900` → standard `struct tm`
+  normalisation (month is 1-based in the string, year is full → `tm_mon-1`, `tm_year-1900`).
+- So `0x5d73c0` must look like e.g. **`2099-12-31 23:59:59`** for a far-future, non-expired session.
+
+---
+
+## 4. THE crash pointer, pinned statically — `0x5d71b0`
+
+Both `fcn.00229760` and `fcn.0022eb08` start with the **identical** sequence:
+
+```
+adrp x8, 0x5d7000
+ldr  x0, [x8, 0x1b0]     ; x0 = *(0x5d71b0)   <- global "app/UI context" object pointer
+ldr  x8, [x0]            ; x8 = *x0 = vtable  <- DEREF #1  (NULL x0 => SIGSEGV HERE)
+ldr  x8, [x8, 0x20]      ; x8 = vtable[+0x20] (a virtual method)
+blr  x8                  ; virtual call
+```
+
+`0x5d71b0` sits in **`.bss`** (`.bss` = `0x5cf880‑0x5f9868`), so it is **NULL at load** and is only set by the
+live init/login. When you NOP the gate (Part 1), you reach §3 with `0x5d71b0 == NULL`, and `ldr x8,[x0]`
+dereferences address `0x0` → **SIGSEGV right as the menu appears**. This is the precise fault Part 2 §5 asked
+for — recovered **without** a logcat backtrace.
+
+### Memory map of the login-critical globals (all runtime-filled)
+
+| Global | Addr | Section | Meaning | At load |
+|---|---|---|---|---|
+| app/UI context obj ptr | `0x5d71b0` | .bss | object whose `vtable[+0x20]` the menu calls | **NULL → crash** |
+| expiry/validkey text | `0x5d73c0` | .bss | std::string parsed by `sscanf` | empty |
+| expected token | `0x5d7258` | .bss | std::string compared in validator | empty |
+| returned token | `0x5d7270` | .bss | std::string compared in validator | empty |
+| response buffer | `0x5ddfc8` | .bss | last server response (must be `"OK"`) | empty |
+| cfg_gate | `0x5d84d0` | .bss | boolean enabling the token compare | 0 |
+| g_net_ready | `0x5deb08` | .bss | set by HTTP callback | 0 |
+| g_isLoggedIn | `0x5deb58` | .bss | validator output | 0 |
+| g_check_inprogress | `0x5d8628` | .bss | validator "busy" lock | 0 |
+| g_expiry_ts | `0x5d8830` | .bss | mktime result | 0 |
+| g_menu_built | `0x5de7f8` | .bss | one-shot menu build flag | 0 |
+
+---
+
+## 5. Goal: render the logged-in UI **without crashing** (study/test only)
+
+Static NOP is a dead end (it leaves `0x5d71b0` NULL → §4). The reliable study routes, in order of robustness:
+
+**Route A — run the real login once (best).** Provide a valid key so the response handler fills `0x5deb08`,
+`0x5ddfc8="OK"`, `0x5d7258==0x5d7270`, `cfg_gate`, and the init that publishes the object at `0x5d71b0`.
+Everything in §4 becomes valid and the menu renders normally. The actual `validkey` is **not in the binary** —
+it comes from the Telegram Bot API response (Part 1 §5).
+
+**Route B — dynamic instrumentation (recommended for study), neutralise detection first.**
+Order matters because of the Part 2 anti-tamper:
+1. Defeat the `/proc/self/maps` scanners (`fcn.00273270`, `fcn.00273598`) and Dobby signal hooks first, else
+   the helper `fork`+`kill -9` (Part 2 §3) terminates you.
+2. **Force the decision *and* its side effects** — hook the validator `fcn.00250dc8` so it (a) returns the
+   success branch and (b) still writes `g_isLoggedIn=1` at `0x5deb58`.
+3. **Seed the state the render reads** before the menu builds:
+   - write a valid std::string `"2099-12-31 23:59:59"` into `0x5d73c0` (so `sscanf`/`mktime`/expiry pass),
+   - publish a **non-NULL, valid C++ object** (with a vtable whose `+0x20` slot is callable) at `0x5d71b0`.
+     The cheapest path is to let the genuine init create it (Route A) rather than fabricate one.
+4. Optionally set `0x5de7f8=0` so the one-shot builders run.
+
+**Route C — pure static (not advised).** You would have to synthesise a real C++ object + vtable at `0x5d71b0`
+and a valid expiry string at `0x5d73c0` inside a writable segment and fix the pointer — i.e. rebuild the exact
+state the login produces. This is precisely what the **login↔state coupling** is designed to prevent.
+
+> Bottom line: there is **no boolean to flip**. The login routine *constructs* the object the UI calls through
+> (`0x5d71b0`) and the data it parses (`0x5d73c0`). Render-without-crash therefore requires that construction to
+> actually happen (Route A) or be faithfully reproduced live (Route B) — not a static patch.
+
+---
+
+## 6. Updated verified-facts table
+
+| Item | Address | Confirmed (Part 3) |
+|---|---|---|
+| Validator (real login logic) | `fcn.00250dc8` | ✅ waits net-flag, requires `"OK"`, token compare |
+| `"OK"` response gate | `0x250f18` (`mov w9,0x4b4f`) | ✅ |
+| Token compare | `0x5d7270` vs `0x5d7258`, memcmp `0x251024` | ✅ |
+| cfg_gate boolean | `0x5d84d0` | ✅ |
+| Success render entry | `0x252778` | ✅ |
+| Date format | `%d-%d-%d %d:%d:%d` @ `0x49cac5` | ✅ |
+| tm adjust constants | `0x494df0` = `-1, -1900` | ✅ |
+| Expiry timestamp store | `0x5d8830` | ✅ |
+| Menu builders | `0x229760`, `0x227b9c`, `0x22eb08` | ✅ |
+| **Crash pointer (NULL deref)** | **`0x5d71b0`** (`vtable[+0x20]` call) | ✅ **pinned statically** |
+| `fcn.0018d250` reclassified | resource/asset+format builder, **not** auth config | ✅ |
+
+_Generated with radare2 6.1.7 — Part 3 of the authorized login study for the user's own project._
