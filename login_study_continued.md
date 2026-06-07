@@ -4,9 +4,6 @@ Tool: **radare2 6.1.7** (built from source, `linux-arm_64`).
 Target: `libProject.so` — ELF64, ARM aarch64, PIE, **stripped**, clang 7.0.0 (Android NDK), C++/libc++.
 Scope: User's own project (kenzaku766/My-Project), authorized study.
 
-This continues `ringkasan.txt` and `login_antitamper_report.txt.js`. Every address/string in
-those notes was **re-verified against the actual binary** with this radare2 build — all confirmed.
-
 ---
 
 ## 1. Re-verified facts
