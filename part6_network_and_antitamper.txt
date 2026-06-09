@@ -1,0 +1,215 @@
+# `libProject.so` — Part 6: The network worker, the *real* config gate, and the anti-tamper internals
+
+Tool: **radare2 6.1.7** (built from source this session, `linux-arm_64`).
+Target: `libProject.so` — ELF64 AArch64 PIE, **stripped**, NDK clang 7, C++/libc++, BoringSSL static.
+Scope: User's own project (kenzaku766/My-Project), authorized study. Follows Parts 1–5.
+
+> Reminder: PIE, `.text` maps at file-offset 0 → **virtual address == file offset** everywhere below.
+
+---
+
+## TL;DR
+
+1. **The network worker is `fcn.00270104`** (a `pthread` entry). It is the missing link Parts 3–5
+   kept referring to: it sets a *new* busy flag `0x5deb0c`, calls **`fcn.0018d250`**, and writes
+   **`g_net_ready = (fcn.0018d250() & 1)`** into `0x5deb08`. So `g_net_ready` is literally
+   *"did the config/login fetch succeed?"*.
+2. **Part 3 §2 undersold `fcn.0018d250`.** It is **not just a resource builder** — it is the
+   **config-load + parse pipeline** whose boolean success drives `g_net_ready`, and it populates the
+   menu-key strings `0x5d8440` / `0x5d8488`. The validator `fcn.00250dc8` spins on `g_net_ready`
+   (the *"Loading config..."* loop) precisely waiting for this worker.
+3. **Two near-identical `/proc/self/maps` scanners** (`fcn.00273270`, `fcn.00273598`) are confirmed:
+   `fopen` → per-line `fgets(buf, 0x800)` → `strlen`; the second one scans every mapping for the
+   **ELF magic `\x7fE…`** (`mov w27, 0x457f`) — i.e. it hunts **injected `.so`** (Frida gadget, etc.).
+4. The **xDL/Dobby** layer at `0x256ee0–0x256f80` is decoded: a byte-wise **`eor …, 0x7e`** name
+   deobfuscation → `dlsym(RTLD_DEFAULT, name)` → **`DobbyInstrument`**, with the resolved pointer
+   **cached at `0x5d7168`** inside a `sleep(1)` retry loop.
+5. The Part 2 **`fork`+`dup2`+`kill -9`** helper is confirmed at `0x2a349c+`: the child path does
+   `close(fd[0]); dup2(fd[1], 0)` (pipe → stdin) and the family ends in `kill(…, 9)` (`SIGKILL`).
+
+---
+
+## 1. The network worker — `fcn.00270104` (this is what produces `g_net_ready`)
+
+```
+0x00270118  bl   __thread_local_dataEv        ; libc++ TLS bootstrap (it's a thread entry)
+0x00270128  bl   pthread_setspecific
+0x0027012c  adrp x20, 0x5de000
+0x00270130  add  x20, x20, 0xb0c              ; &g_net_inflight @ 0x5deb0c   (NEW global)
+0x00270138  stlrb w8(=1), [x20]               ; g_net_inflight = 1  (release-store "busy")
+0x0027013c  bl   fcn.0018d250                 ; <<< the config/login FETCH+PARSE
+0x00270144  and  w8, w0, 1                    ; w8 = success bit of fcn.0018d250
+0x00270148  adrp x9, 0x5de000 ; add x9,#0xb08 ; &g_net_ready @ 0x5deb08
+0x0027014c  stlrb w8, [x9]                    ; g_net_ready = (fcn.0018d250() & 1)   ★
+0x00270150  stlrb wzr, [x20]                  ; g_net_inflight = 0  (done)
+0x00270154… thread_struct dtor + operator delete   ; tidy the thread arg, return
+```
+
+**Why this matters.** Part 3 located the validator's wait loop (`fcn.00250dc8`, *"Loading config…"*
+spinning on `g_net_ready @ 0x5deb08`) but not *who sets it*. **This is who.** The login state machine
+is therefore a two-thread handshake:
+
+```
+ dispatcher fcn.002519b0  ──spawns──► worker fcn.00270104
+        │                                   │ busy=1 (0x5deb0c)
+        │                                   │ ok = fcn.0018d250()   ← config + telegram fetch/parse
+        │                                   │ g_net_ready = ok (0x5deb08)
+        │ validator fcn.00250dc8            │ busy=0
+        └─ spins on g_net_ready ◄───────────┘
+           then requires resp=="OK" && token match → g_isLoggedIn=1
+```
+
+New global discovered: **`0x5deb0c` = `g_net_inflight`** (worker busy lock, release/acquire byte).
+
+## 2. `fcn.0018d250` reclassified (correcting Part 3 §2)
+
+Part 3 demoted `fcn.0018d250` to "resource/asset + format builder, not the auth parser." That is
+**too dismissive**. Verified references inside the function body this session:
+
+```
+0x18d28c  bl malloc            0x18d2c0  bl strlen        0x18d320  bl memcpy      ; buffer build
+0x18d324  adrp x8, 0x5d8000    …                                                   ; config-string page
+0x18d364  adrp x8, 0x5d8000    …                          ; menu keys 0x5d8440/0x5d8488 live here
+0x18d4f8  adrp x1, 0x49c000  ; bl 0x18e194                ; %-format constants (parse templates)
+0x18d514  adrp x1, 0x49c000  ; bl 0x18e194
+0x18d56c  bl 0x16d00c                                     ; std::string assign (same helper the
+                                                          ; validator uses to fill 0x5ddfc8)
+```
+
+So `fcn.0018d250` **builds/parses config strings and assigns runtime std::strings**, and — per §1 —
+its boolean result *is* `g_net_ready`. It is the **config/login readiness producer**, not a passive
+asset builder. The honest statement:
+
+> `fcn.0018d250` = "load + parse the config/login response; return success." It populates the
+> menu-key strings the main menu reads and gates the whole validator via `g_net_ready`.
+
+**Caveat (kept honest):** within the disassembled window the **actual HTTPS send** to
+`https://api.telegram.org/bot` (`@0x4a295b`) is **not inline** — it is performed by a callee
+(BoringSSL `SSL_connect`/`SSL_write` are statically linked; see `.dynstr`). The URL + `bot_id`
+(`@0x49c862`), `validkey` (`@0x49c859`), `secret` (`@0x49c852`), `login` (`@0x49c830`) fields are the
+`myKey.xml` (`@0x4a3855`) keys this pipeline consumes. The split `adrp+add` loads defeat r2's plain
+`axt`, which is why Parts 1–5 (and a naive `aar`) never resolved these string xrefs — they must be
+read off the disassembly directly, as done here.
+
+## 3. The `/proc/self/maps` scanners — internals (Part 2 §3 had only the string)
+
+Two near-identical functions, both with **no direct xref** (called via fn-ptr/thread/Dobby, exactly
+the indirection Parts 2 & 4 predicted):
+
+### `fcn.00273270`
+```
+bl fopen("/proc/self/maps")          ; cbz → bail to 0x2734b4
+bl feof
+loop:  fgets(buf, 0x800, fp)         ; 2 KiB line buffer
+       strlen(buf)
+       cmp len, 0x800                 ; guard over-long lines
+       …parse each mapping line…
+fail string: "[!] /proc/self/maps parse failed!"  @ 0x4e8707
+```
+
+### `fcn.00273598` (the *injection* detector)
+Same `fopen`/`feof`/`fgets(…,0x800)` skeleton, **plus**:
+```
+0x002735c8  mov w27, 0x457f          ; 0x457f = bytes 'E','\x7f' → the ELF magic "\x7fELF"
+```
+It compares the bytes at each mapped region against the **ELF magic**, i.e. it walks every
+`r-xp` mapping and flags **unexpected loaded ELF objects** (a freshly-`dlopen`'d Frida gadget /
+injected `.so`). This is the classic "scan maps for foreign ELF headers" anti-injection check.
+
+## 4. xDL + Dobby symbol resolution — decoded (`0x256ee0–0x256f80`)
+
+```
+0x256ee0  eor w9,  w9, 0x7e
+0x256ee8  eor w10, w10, 0x7e          ; byte-wise XOR-0x7e DEOBFUSCATION of a symbol name
+0x256efc  strb w9,  [x8, 0xe]         ;   …assembled into a stack buffer at x8…
+0x256f00  eor w10, w10, 0x7e
+0x256f08  adrp x1, 0x5f4000 ; add x1,#0x668   ; name buffer @ 0x5f4668
+0x256f10  mov  x0, -1                  ; RTLD_DEFAULT (0xffffffffffffffff)
+0x256f14  bl   dlsym                   ; dlsym(RTLD_DEFAULT, decoded_name)
+0x256f20  bl   DobbyInstrument         ; install inline hook (hook fn @ 0x256818)
+0x256f40  str  x0, [x20, 0x168]        ; cache resolved ptr @ 0x5d7168   (NEW global)
+0x256f44  mov  w0, 1 ; bl sleep        ; retry loop:
+0x256f4c  ldr  x8, [x20, 0x168]
+0x256f50  cbz  x8, 0x256f38            ;   …keep sleeping(1s) until resolved…
+0x256f78  bl   __android_log_print     ; logs on the failure branch
+```
+
+So the obfuscated string is **never stored in clear** in `.rodata`; it is rebuilt at runtime by
+XOR-`0x7e`, resolved with `dlsym(RTLD_DEFAULT, …)`, hooked via **Dobby**, and the result memoised at
+**`0x5d7168`**. This is the xDL "stealth symbol resolution" envelope Part 2 §6 flagged, now with the
+exact mechanism (`eor 0x7e`, the `dlsym` arg buffer, and the cache slot).
+
+## 5. The `fork`+`dup2`+`kill -9` watchdog — confirmed (Part 2 §3)
+
+```
+0x2a349c  bl   fork
+0x2a34a0  cmn  w0, 1                    ; fork == -1 ?
+0x2a34a8  b.eq 0x2a35d4                 ;   error path
+0x2a34ac  cbnz w0, 0x2a3598            ; parent (pid>0) → 0x2a3598
+0x2a34b0  ldr  w0, [x24]   ; bl close   ; CHILD: close(fd[0])
+0x2a34b8  ldr  w0, [x24,4] ; mov w1,0    ;        dup2(fd[1], 0)  → pipe wired to STDIN
+0x2a34c0  bl   dup2
+…
+(family ends in)  kill(<pid>, 9)  @ 0x2a3984   ; SIGKILL  (Part 2)
+```
+
+A forked helper that rebinds a pipe to **stdin** (to feed a shell/exec a command stream) and can
+**`SIGKILL`** on a failed check. No `ptrace` import anywhere — anti-debug here is this helper plus the
+Dobby/`sigaction` signal layer, consistent with Parts 2 & 4.
+
+## 6. Updated global / function map (additions this part)
+
+| Symbol | Addr | Section | Meaning | First seen |
+|---|---|---|---|---|
+| **g_net_inflight** | **`0x5deb0c`** | .bss | worker busy lock (release/acquire byte) | Part 6 |
+| **xdl/Dobby sym cache** | **`0x5d7168`** | .bss | cached `dlsym` result, hooked by Dobby | Part 6 |
+| network worker (thread) | `fcn.00270104` | .text | sets `g_net_ready = fcn.0018d250()` | Part 6 |
+| config load+parse | `fcn.0018d250` | .text | produces `g_net_ready` + menu-key strings (reclassified) | Part 6 |
+| maps scanner (parse) | `fcn.00273270` | .text | `/proc/self/maps` line parser | Part 2→6 |
+| maps scanner (ELF hunt) | `fcn.00273598` | .text | scans mappings for `\x7fELF` (injected .so) | Part 6 |
+| xDL/Dobby resolver | `0x256ee0` | .text | `eor 0x7e` name → `dlsym` → `DobbyInstrument` | Part 2→6 |
+| fork watchdog | `~0x2a349c` | .text | `fork`+`dup2(.,0)`+`kill -9` | Part 2→6 |
+
+## 7. Consolidated login control-flow (Parts 1–6)
+
+```
+JNI_OnLoad (0x257074)      → caches JavaVM* @ 0x5d71b0 (never NULL at runtime)  [Part 4]
+dispatcher fcn.002519b0    → pthread_create(worker fcn.00270104) @ 0x251a34
+worker fcn.00270104        → busy=1(0x5deb0c); ok=fcn.0018d250(); g_net_ready=ok(0x5deb08); busy=0
+config fcn.0018d250        → fetch (telegram/myKey.xml) + parse → fills 0x5d8440/0x5d8488, returns ok
+validator fcn.00250dc8     → spin on g_net_ready → require resp=="OK"(0x250f18)
+                              → token compare 0x5d7270 vs 0x5d7258 (memcmp 0x251024)
+                              → g_isLoggedIn=1 @ 0x251048 (0x5deb58)
+gate 0x2522ec (cbz)        → g_isLoggedIn ? main-menu(0x2522f0) : login-menu(0x2523bc)
+main menu                  → derefs 0x5d71b0 vtable[+0x20] = AttachCurrentThread [Part 4]
+guards (indirect)          → maps scanners 0x273270/0x273598, Dobby@0x256ee0, fork-kill@0x2a349c
+```
+
+## 8. Honest conclusions / what's still open
+
+- **There is still no static "magic byte" to flip.** Part 5's Recipe A+B remains the smallest static
+  change, but §1–2 here reinforce *why* it is fragile: `g_net_ready` and the menu-key strings are
+  produced by a **separate worker thread** (`fcn.00270104` → `fcn.0018d250`). Patching the validator
+  without that worker running leaves the config strings empty.
+- **Cleanest study route is still runtime** (Frida): poke `g_isLoggedIn @ 0x5deb58` *and* let the
+  worker populate config, *after* neutralising the two maps scanners (`0x273270`, `0x273598`) and the
+  Dobby layer — otherwise the `fork`+`kill -9` watchdog fires.
+- **Not recoverable statically:** the real `validkey` (comes from the live Telegram reply) and the
+  XOR-`0x7e`'d symbol name (rebuilt only at runtime into `0x5f4668`). To get either you must run/trace.
+
+### Reproduce the key findings in radare2
+```sh
+r2 -q libProject.so
+# worker → g_net_ready link
+pd 24 @ 0x270104
+# config pipeline refs
+pd 200 @ 0x18d250 | grep -E '0x5d8000|0x49c000|0x16d00c|malloc|strlen|memcpy'
+# maps scanners
+pd 26 @ 0x273270 ; pd 14 @ 0x273598
+# xDL/Dobby
+pd 24 @ 0x256ee0
+# fork watchdog
+pd 18 @ 0x2a3494
+```
+
+_Generated with radare2 6.1.7 — Part 6 of the authorized login study for the user's own project (kenzaku766/My-Project)._

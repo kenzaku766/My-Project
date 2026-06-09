@@ -1,0 +1,102 @@
+# libProject.so — VERDICT: Static patch vs Frida for "skip login, show main menu"
+
+Authorized study, kenzaku766/My-Project. radare2 6.1.7. Summarises Parts 1-6.
+
+================================================================
+BOTTOM LINE
+================================================================
+Static patching can make the main menu APPEAR, but NOT function/avoid a crash.
+Use FRIDA. It is the only clean route to a working main menu.
+
+Reason in one line: login is NOT a boolean - it is a two-thread handshake that
+*constructs* the state (JNI object @0x5d71b0, config strings @0x5d8440/0x5d8488,
+g_net_ready @0x5deb08) that the main menu reads. Skip login statically -> those
+globals stay NULL/empty -> SIGSEGV the moment the menu builds.
+
+================================================================
+COMPARISON
+================================================================
+Capability                                  | Static .so patch | Frida (runtime)
+--------------------------------------------|------------------|-----------------
+Skip gate cbz @0x2522ec                      | YES (1 NOP)      | YES
+Main menu renders WITHOUT crashing           | NO               | YES
+Survives anti-tamper (maps/Dobby/watchdog)   | FRAGILE          | YES (.bss only)
+Recover the real validkey                    | IMPOSSIBLE*      | YES (intercept)
+Effort / reliability                         | high / low       | medium / high
+*validkey is delivered by the live Telegram Bot API reply; it is not in the binary.
+
+================================================================
+WHY STATIC ALONE FAILS (verified, Parts 3-6)
+================================================================
+Control flow:
+  JNI_OnLoad 0x257074      -> caches JavaVM* @0x5d71b0 (non-NULL at runtime)
+  dispatcher fcn.002519b0  -> pthread_create(worker fcn.00270104) @0x251a34
+  worker fcn.00270104      -> busy=1(0x5deb0c); ok=fcn.0018d250();
+                              g_net_ready=ok (0x5deb08); busy=0
+  config fcn.0018d250      -> fetch+parse (telegram / myKey.xml) ->
+                              fills menu keys 0x5d8440 / 0x5d8488; returns ok
+  validator fcn.00250dc8   -> spin on g_net_ready -> require resp=="OK"(0x250f18)
+                              -> token compare 0x5d7270 vs 0x5d7258 (memcmp 0x251024)
+                              -> g_isLoggedIn=1 @0x251048 (byte 0x5deb58)
+  gate 0x2522ec  cbz w8 ->  g_isLoggedIn ? main(0x2522f0) : login(0x2523bc)
+  main menu builders       -> deref 0x5d71b0; vtable[+0x20] = AttachCurrentThread
+
+If you NOP 0x2522ec without a real login:
+  - 0x5d71b0 object, 0x5d8440/0x5d8488 strings, g_net_ready are produced by the
+    SEPARATE worker thread + login flow. They are empty/NULL.
+  - main menu derefs them -> crash (Part 3/4 pinned this).
+Recipe A+B (Part 5) only "sees" the menu; it is brittle and still leaves
+login-produced globals empty for any deeper UI widget.
+
+================================================================
+ANTI-TAMPER THAT FIGHTS A STATIC PATCH (Part 6)
+================================================================
+- /proc/self/maps scanner fcn.00273270  (line parser)
+- /proc/self/maps scanner fcn.00273598  (hunts each mapping for \x7fELF magic =
+  injected/foreign .so detection)
+- xDL/Dobby resolver @0x256ee0: eor-0x7e name -> dlsym(RTLD_DEFAULT) ->
+  DobbyInstrument; cached @0x5d7168
+- fork + dup2(.,0) + kill(.,9) watchdog @0x2a349c  (can SIGKILL on detection)
+- No ptrace import; anti-debug is via the watchdog + sigaction signal layer.
+
+================================================================
+RECOMMENDED: FRIDA HARNESS (study skeleton)
+================================================================
+Order matters: neutralise detection BEFORE poking, or the watchdog fires.
+
+  // 1) Wait for libProject.so to be mapped (after JNI_OnLoad)
+  const wait = setInterval(() => {
+    const base = Module.findBaseAddress('libProject.so');
+    if (!base) return;
+    clearInterval(wait);
+
+    // 2) Blind the two /proc/self/maps scanners (return early / empty)
+    [0x273270, 0x273598].forEach(off => {
+      Interceptor.replace(base.add(off), new NativeCallback(
+        () => 0, 'int', []));
+    });
+
+    // 3) Let the REAL config worker run so menu state initialises,
+    //    then force the flag and keep it set (undo any logout write).
+    const FLAG = base.add(0x5deb58);      // g_isLoggedIn
+    Memory.protect(FLAG, 1, 'rw-');
+    setInterval(() => { FLAG.writeU8(1); }, 200);
+
+    // 4) (Optional) force validator success WITHOUT skipping its side effects:
+    //    hook fcn.00250dc8 return so config strings still get populated.
+    //    Prefer this over Recipe C so 0x5d7258/0x5d7270/0x5ddfc8 are filled.
+  }, 50);
+
+Notes:
+- Writing to .bss (0x5deb58) escapes the maps/Dobby code-hash checks.
+- To also recover the validkey: hook the BoringSSL SSL_read/SSL_write or the
+  response handler to dump the Telegram Bot API JSON at runtime.
+
+================================================================
+TL;DR ANSWER
+================================================================
+Static patch  -> good ONLY to *understand* control flow / momentarily see the menu.
+Frida         -> the correct, reliable way to skip login and land on a WORKING
+                 main menu, because login bootstraps the state the menu needs.
+
+Generated with radare2 6.1.7 - authorized study, kenzaku766/My-Project.
